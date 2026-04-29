@@ -12,10 +12,11 @@ Items marked **[req]** map directly to the 6 class requirements.
 
 ## Milestone 1 — Data pipelines  ✅ DONE
 - [x] **Bible loader** writes 31,100 verses to `data/bible/bible.json`
-- [x] **BEMA scraper** wrote 16 episode transcripts (~126 K words)
-  - Note: only the first 16 episodes are in the static HTML on
-    bemadiscipleship.com; the full archive uses JS pagination.
-    Stretch goal: switch to Playwright to scrape all ~400 episodes.
+- [x] **BEMA scraper** wrote 259 episode transcripts (~1.65 M words, 9.3 MB)
+  - Switched discovery from the JS-paginated archive page to BEMA's
+    official Fireside JSON feed (`bema.fireside.fm/json`). All 507
+    episodes are now visible to the scraper; 259 of them have published
+    transcripts (the remaining 248 simply don't have one published).
 
 ## Milestone 2 — Retrieval tools  ✅ DONE  **[req: tools]**
 - [x] `src/bible_tool.py` — `lookup("John 3:16")`, `lookup("Gen 1:1-3")`,

@@ -4,25 +4,34 @@ Scrape BEMA Discipleship podcast transcripts.
 Why this script exists
 ----------------------
 BEMA episodes have transcripts published as Google Docs linked from each
-episode page on bemadiscipleship.com. We need them as local plain-text files
-so the BEMA tool can do TF-IDF retrieval over them without hitting the
-network at query time.
+episode. We need them as local plain-text files so the BEMA tool can do
+TF-IDF retrieval over them without hitting the network at query time.
 
-What it does
-------------
-1. Fetches the episode index (https://www.bemadiscipleship.com/episodes)
-   and parses out (number, title) for every episode.
-2. For each episode, fetches https://www.bemadiscipleship.com/{number} and
-   looks for a "Transcript for BEMA N" link pointing to docs.google.com.
-3. Downloads the published Google Doc HTML, extracts clean text, and writes
-   it to data/bema/transcripts/{number}.txt.
-4. Saves all episode metadata to data/bema/episodes.json.
+How it works (v2 — 2026-04)
+---------------------------
+The static episode archive page (bemadiscipleship.com/episodes) only
+exposes ~16 episodes in its initial HTML; the rest are JS-paginated. So
+instead we use BEMA's official **JSON feed**:
+
+    https://bema.fireside.fm/json
+
+…which lists *all* episodes (currently 507). For each episode we:
+
+  1. Look in the show-notes HTML inside the feed itself for a
+     `docs.google.com/document/...` link. This works for ~50% of episodes
+     and saves a network round-trip.
+  2. Otherwise, fetch the episode page (e.g. https://www.bemadiscipleship.com/257)
+     and look for the "Transcript for BEMA N" link there.
+  3. If a transcript URL is found, fetch the published Google Doc HTML,
+     strip Google's chrome and Boilerplate, and save the body as
+     `data/bema/transcripts/<number>.txt`.
+  4. Save all metadata to `data/bema/episodes.json`.
 
 Be polite
 ---------
 - Custom User-Agent
-- 1 second delay between requests
-- --max-episodes flag so you can test with a small batch first
+- Small delay between requests
+- --max-episodes flag for testing
 - Skips episodes whose transcript file already exists
 """
 
@@ -33,101 +42,117 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-BASE = "https://www.bemadiscipleship.com"
-INDEX_URL = f"{BASE}/episodes"
+FEED_URL = "https://bema.fireside.fm/json"
 HEADERS = {
     "User-Agent": (
         "BibleStudyVA-ClassProject/0.1 "
         "(educational use; contact: student@example.edu)"
     )
 }
-SLEEP_SECONDS = 0.4  # be polite but not glacial
+SLEEP_SECONDS = 0.4  # polite-ish
 
 ROOT = Path(__file__).resolve().parent.parent
 TRANSCRIPT_DIR = ROOT / "data" / "bema" / "transcripts"
 EPISODES_JSON = ROOT / "data" / "bema" / "episodes.json"
 
+GOOGLE_DOC_RE = re.compile(
+    r"https://docs\.google\.com/document/d/(?:e/)?[A-Za-z0-9_\-]+(?:/pub)?",
+    re.IGNORECASE,
+)
+# Episode numbers in URLs may be negative (-1, 0, 1, ..., 502)
+# or have a letter suffix (e.g. "12b"). We extract whatever follows the
+# final "/" of the URL.
+URL_NUMBER_RE = re.compile(r"/(-?\d+[a-zA-Z]?)/?$")
+
 
 @dataclass
 class Episode:
-    number: str           # keep as string; some episodes are "-1", "0", "12b"
+    number: str
     title: str
     url: str
+    date_published: str = ""
     transcript_url: str | None = None
     transcript_path: str | None = None
+    note: str = ""  # short status: "ok", "no-transcript", "skipped", etc.
 
 
 # ---------------------------------------------------------------------------
-# Index parsing
+# Feed → episodes
 # ---------------------------------------------------------------------------
 
-# Episode headings on the archive look like: "<h3>1: Trust the Story</h3>"
-EPISODE_HEADING_RE = re.compile(r"^\s*(-?\d+[a-zA-Z]?)\s*:\s*(.+?)\s*$")
-
-
-def fetch(url: str) -> str:
+def fetch(url: str) -> requests.Response:
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
-    return r.text
+    return r
 
 
-def parse_episode_index(html: str) -> list[Episode]:
-    soup = BeautifulSoup(html, "lxml")
+def episode_number_from_url(url: str) -> str | None:
+    m = URL_NUMBER_RE.search(url.rstrip("/"))
+    return m.group(1) if m else None
+
+
+def load_episodes_from_feed() -> list[Episode]:
+    print(f"[bema] fetching feed: {FEED_URL}")
+    data = fetch(FEED_URL).json()
+    items = data.get("items", [])
     episodes: list[Episode] = []
-    seen: set[str] = set()
-    # Headings on the archive page are h3; titles are "{number}: {title}".
-    for h in soup.find_all(["h2", "h3", "h4"]):
-        text = h.get_text(strip=True)
-        m = EPISODE_HEADING_RE.match(text)
-        if not m:
+    for item in items:
+        url = item.get("url", "")
+        number = episode_number_from_url(url)
+        if number is None:
             continue
-        number, title = m.group(1), m.group(2)
-        if number in seen:
-            continue
-        seen.add(number)
         episodes.append(Episode(
             number=number,
-            title=title,
-            url=f"{BASE}/{number}",
+            title=item.get("title", "").strip(),
+            url=url,
+            date_published=item.get("date_published", ""),
         ))
+    # The feed lists newest first; sort old-to-new so progress feels natural.
+    def sort_key(ep: Episode):
+        # numeric first (with letter suffix grouped), then by published date
+        m = re.match(r"(-?\d+)([a-zA-Z]?)$", ep.number)
+        if m:
+            return (int(m.group(1)), m.group(2))
+        return (10**9, ep.number)
+    episodes.sort(key=sort_key)
     return episodes
 
 
-# ---------------------------------------------------------------------------
-# Per-episode transcript discovery
-# ---------------------------------------------------------------------------
-
-TRANSCRIPT_LINK_RE = re.compile(r"transcript", re.IGNORECASE)
+def find_transcript_in_html(html: str) -> str | None:
+    m = GOOGLE_DOC_RE.search(html)
+    return m.group(0) if m else None
 
 
-def find_transcript_url(episode_html: str) -> str | None:
-    """
-    Episode pages list 1+ Google Docs transcript links labeled
-    "Transcript for BEMA N". When multiple exist (legacy + current), prefer
-    the first one because the page lists current/preferred transcripts first.
-    """
-    soup = BeautifulSoup(episode_html, "lxml")
+def find_transcript_on_episode_page(episode_url: str) -> str | None:
+    """Fetch the episode page and look for a 'Transcript for BEMA N' link."""
+    try:
+        html = fetch(episode_url).text
+    except Exception:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    # Prefer anchor tags whose label mentions transcript.
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "docs.google.com/document" not in href:
             continue
-        if TRANSCRIPT_LINK_RE.search(a.get_text() or ""):
+        label = (a.get_text() or "").lower()
+        if "transcript" in label:
             return href
-    return None
+    # Fallback: any Google Doc link on the page.
+    return find_transcript_in_html(html)
 
 
 # ---------------------------------------------------------------------------
 # Google Doc cleaning
 # ---------------------------------------------------------------------------
 
-# Lines that appear in every published Google Doc and are not transcript content.
 GDOC_BOILERPLATE = (
     "Published by Google Docs",
     "Mit Google Docs veröffentlicht",
@@ -142,12 +167,8 @@ GDOC_BOILERPLATE = (
 
 def clean_gdoc(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
-
-    # Strip script/style/nav noise
     for tag in soup(["script", "style", "nav", "header", "footer"]):
         tag.decompose()
-
-    # Google Docs publishes the body inside #contents; fall back to body.
     body = soup.select_one("#contents") or soup.body or soup
     text = body.get_text("\n", strip=True)
 
@@ -160,11 +181,16 @@ def clean_gdoc(html: str) -> str:
             continue
         lines.append(line)
 
-    # Collapse runs of blank-ish formatting; rejoin with single newlines.
     cleaned = "\n".join(lines)
-    # Collapse runs of 3+ newlines down to 2.
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
+
+
+def ensure_pub_url(url: str) -> str:
+    """Make sure the URL ends in /pub so we get the published HTML view."""
+    if "/pub" in url:
+        return url
+    return url.rstrip("/") + "/pub"
 
 
 # ---------------------------------------------------------------------------
@@ -175,66 +201,94 @@ def safe_filename(number: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", number) + ".txt"
 
 
-def scrape(max_episodes: int | None, force: bool) -> list[Episode]:
+def scrape(max_episodes: int | None, force: bool, only_missing: bool) -> list[Episode]:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-
-    print(f"[bema] fetching episode index: {INDEX_URL}")
-    episodes = parse_episode_index(fetch(INDEX_URL))
-    print(f"[bema] found {len(episodes)} episodes")
+    episodes = load_episodes_from_feed()
+    print(f"[bema] feed listed {len(episodes)} episodes")
 
     if max_episodes:
         episodes = episodes[:max_episodes]
-        print(f"[bema] limiting to first {max_episodes} for this run")
+        print(f"[bema] limiting to first {max_episodes}")
+
+    # We need each episode's show-notes HTML for the in-feed transcript hint.
+    # Re-fetch the feed once and index by URL.
+    feed_html_by_url: dict[str, str] = {}
+    feed = fetch(FEED_URL).json()
+    for item in feed.get("items", []):
+        feed_html_by_url[item.get("url", "")] = item.get("content_html", "")
+
+    saved = 0
+    skipped_existing = 0
+    no_transcript = 0
+    errors = 0
 
     for ep in tqdm(episodes, desc="episodes"):
         out_path = TRANSCRIPT_DIR / safe_filename(ep.number)
         ep.transcript_path = str(out_path.relative_to(ROOT))
 
         if out_path.exists() and not force:
-            # Already scraped — still record transcript_url if missing
-            ep.transcript_url = ep.transcript_url or "<cached>"
+            ep.note = "cached"
+            skipped_existing += 1
+            continue
+
+        if only_missing and out_path.exists():
+            ep.note = "cached"
+            skipped_existing += 1
             continue
 
         try:
-            episode_html = fetch(ep.url)
-            time.sleep(SLEEP_SECONDS)
+            # Step 1: try to find transcript URL inside the feed's show notes.
+            t_url = find_transcript_in_html(feed_html_by_url.get(ep.url, ""))
 
-            t_url = find_transcript_url(episode_html)
+            # Step 2: fall back to fetching the episode page.
             if not t_url:
-                tqdm.write(f"[bema] no transcript link on {ep.url}; skipping")
+                t_url = find_transcript_on_episode_page(ep.url)
+                time.sleep(SLEEP_SECONDS)
+
+            if not t_url:
+                ep.note = "no-transcript"
                 ep.transcript_path = None
+                no_transcript += 1
                 continue
+
             ep.transcript_url = t_url
-
-            doc_html = fetch(t_url)
+            doc_html = fetch(ensure_pub_url(t_url)).text
             time.sleep(SLEEP_SECONDS)
-
             text = clean_gdoc(doc_html)
-            if len(text) < 500:
-                tqdm.write(f"[bema] suspiciously short transcript for {ep.number} "
-                           f"({len(text)} chars); keeping anyway")
+
+            if len(text) < 300:
+                ep.note = f"short ({len(text)} chars)"
+            else:
+                ep.note = "ok"
             out_path.write_text(text, encoding="utf-8")
+            saved += 1
         except Exception as e:  # noqa: BLE001
-            tqdm.write(f"[bema] failed on episode {ep.number}: {e}")
+            ep.note = f"error: {e}"
             ep.transcript_path = None
+            errors += 1
+            tqdm.write(f"[bema] episode {ep.number}: {e}")
 
     EPISODES_JSON.write_text(
         json.dumps([asdict(e) for e in episodes], indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    saved = sum(1 for e in episodes if e.transcript_path)
-    print(f"[bema] done. {saved}/{len(episodes)} transcripts saved under {TRANSCRIPT_DIR}")
+    print(
+        f"\n[bema] summary: saved={saved} skipped_existing={skipped_existing} "
+        f"no_transcript={no_transcript} errors={errors} of {len(episodes)} total"
+    )
     return episodes
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Scrape BEMA podcast transcripts")
     p.add_argument("--max-episodes", type=int, default=None,
-                   help="Only scrape the first N episodes (good for testing).")
+                   help="Only process the first N episodes (good for testing).")
     p.add_argument("--force", action="store_true",
                    help="Re-download transcripts that are already on disk.")
+    p.add_argument("--only-missing", action="store_true",
+                   help="Process only episodes whose transcript file is missing.")
     args = p.parse_args()
-    scrape(args.max_episodes, args.force)
+    scrape(args.max_episodes, args.force, args.only_missing)
     return 0
 
 

@@ -13,7 +13,7 @@ generated from evidence retrieved through tools, not the model's memory.
 |---|---|
 | Folder structure + 8 source modules + 2 scripts | ✅ written |
 | Bible JSON (KJV, 31,100 verses, 6.3 MB) | ✅ downloaded |
-| BEMA transcripts (16 episodes, ~126 K words) | ✅ scraped |
+| BEMA transcripts (259 episodes, ~1.65 M words, 9.3 MB) | ✅ scraped |
 | Bible tool (lookup + TF-IDF search) | ✅ tested |
 | BEMA tool (chunked TF-IDF search) | ✅ tested |
 | Web tool (DuckDuckGo) | ✅ written, untested locally |
@@ -49,8 +49,8 @@ bible-study-va/
 │   ├── bible/
 │   │   └── bible.json            # 31,100 verses, ~6 MB (gitignored)
 │   └── bema/
-│       ├── episodes.json         # episode metadata (gitignored)
-│       └── transcripts/          # 16 .txt files (gitignored)
+│       ├── episodes.json         # episode metadata for all 507 (gitignored)
+│       └── transcripts/          # 259 .txt files (gitignored)
 ├── src/
 │   ├── bible_tool.py             # verse lookup + search
 │   ├── bema_tool.py              # transcript chunking + TF-IDF
@@ -81,9 +81,9 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2) data  (~10s + ~35s)
+# 2) data  (~10s + ~9 min for the full 507 episodes)
 python scripts/load_bible.py
-python scripts/scrape_bema.py --max-episodes 30
+python scripts/scrape_bema.py                     # all 507; or --max-episodes N for a quick test
 
 # 3) sanity check
 pytest tests/ -v        # 11 tests, ~3 seconds
@@ -118,9 +118,10 @@ print(agent.answer('What is a chiasm?', MockLLM(), 'zero_shot').text)
 
 ## Known limitations
 
-- **BEMA corpus is partial** (16 of ~400 episodes). The bemadiscipleship.com
-  archive lazy-loads with JS; only the static portion was scraped. Adding
-  Selenium/Playwright to the scraper would unlock the full corpus.
+- **BEMA corpus is 259 / 507 episodes.** The remaining 248 episodes simply
+  do not have transcripts published. The scraper now uses BEMA's official
+  Fireside JSON feed for episode discovery (the static archive page only
+  exposes the first ~16 episodes, which was the original limitation).
 - **TF-IDF is keyword-based.** Vague questions ("hidden meanings behind X")
   may retrieve weak matches because TF-IDF over-weights the vague words. A
   switch to sentence-transformer embeddings would help.
