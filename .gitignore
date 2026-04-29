@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (downloaded / scraped at runtime)
+data/bible/*.json
+data/bema/transcripts/*.txt
+data/bema/episodes.json
+
+# Keep folder structure
+!data/bible/.gitkeep
+!data/bema/.gitkeep
+!data/bema/transcripts/.gitkeep
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Hugging Face cache (local runs)
+.cache/

@@ -1,0 +1,27 @@
+# --- core LLM stack ---
+transformers>=4.44.0
+accelerate>=0.33.0
+torch>=2.2.0
+sentencepiece>=0.2.0
+bitsandbytes>=0.43.0          # for 4-bit Mistral-7B in Colab
+
+# --- retrieval / scoring ---
+scikit-learn>=1.4.0           # TF-IDF for BEMA / Bible search
+numpy>=1.26.0
+
+# --- scraping ---
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+tqdm>=4.66.0
+
+# --- web search tool (no API key) ---
+duckduckgo-search>=6.1.0
+
+# --- notebook ---
+jupyterlab>=4.0.0
+ipywidgets>=8.1.0
+
+# --- evaluation / nice-to-have ---
+pandas>=2.2.0
+matplotlib>=3.8.0
