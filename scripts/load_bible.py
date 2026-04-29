@@ -49,13 +49,14 @@ def parse_thiagobodruk(raw: list) -> Iterable[dict]:
     """
     Source schema:
         [
-          {"abbrev": "gn", "book": "Genesis",
+          {"abbrev": "gn", "name": "Genesis",
            "chapters": [["v1 text", "v2 text", ...], [...]]},
           ...
         ]
     """
     for book in raw:
-        book_name = book["book"]
+        # Some mirrors use "name", others "book"; accept either.
+        book_name = book.get("name") or book["book"]
         for chap_idx, chapter in enumerate(book["chapters"], start=1):
             for verse_idx, text in enumerate(chapter, start=1):
                 yield {

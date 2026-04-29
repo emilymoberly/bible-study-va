@@ -38,8 +38,13 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 # Direct verse references like "John 3:16", "Genesis 1", "1 Cor 13:4-7".
+# We deliberately match only:
+#   - a single capitalized word ("John", "Genesis"), optionally with a 1/2/3 prefix
+#   - or "Song of Solomon" / "Song of Songs" specifically
+# This prevents over-matching e.g. "Explain John 3:16" -> "Explain John 3:16".
 VERSE_REF_RE = re.compile(
-    r"\b(?:\d\s*)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+\d+(?::\d+(?:-\d+)?)?\b"
+    r"\b(?:(?:[123]\s+)?[A-Z][a-z]+|Song\s+of\s+(?:Solomon|Songs))"
+    r"\s+\d+(?::\d+(?:-\d+)?)?\b"
 )
 
 BEMA_KEYWORDS = ("bema", "podcast", "marty solomon", "brent billings",

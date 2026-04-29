@@ -28,8 +28,14 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
 )
+
+try:
+    from transformers import BitsAndBytesConfig  # only available with bitsandbytes
+    _HAS_BNB = True
+except ImportError:
+    BitsAndBytesConfig = None  # type: ignore[assignment]
+    _HAS_BNB = False
 
 
 ModelKey = Literal["phi3", "mistral"]
@@ -74,11 +80,16 @@ class LLM:
             False -> force fp16/bf16
         """
         model_id = MODEL_IDS[key]
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
         use_4bit = (
             prefer_4bit
             if prefer_4bit is not None
-            else (key == "mistral" and device == "cuda")
+            else (key == "mistral" and device == "cuda" and _HAS_BNB)
         )
 
         print(f"[llm] loading {model_id} (device={device}, 4bit={use_4bit})")
@@ -151,4 +162,63 @@ class LLM:
             latency_s=latency,
             tokens_in=tokens_in,
             tokens_out=int(generated.shape[0]),
+        )
+
+
+# ---------------------------------------------------------------------------
+# MockLLM — a stand-in that doesn't load any weights.
+#
+# Why this exists: the real models (Phi-3.5-mini, Mistral-7B) need a GPU,
+# which a low-RAM laptop doesn't have. MockLLM lets us run the *agent
+# pipeline* (route -> retrieve -> prompt -> answer) end-to-end locally so we
+# can debug routing, retrieval, and security tests without firing up Colab.
+#
+# It just echoes back a structured summary of the prompt + evidence. It is
+# NOT a substitute for the real models in the comparison/quality cells.
+# ---------------------------------------------------------------------------
+
+
+class MockLLM:
+    """Deterministic fake LLM. Same `.generate()` signature as `LLM`."""
+
+    model_id = "mock-llm-v1"
+    key = "mock"
+
+    def __init__(self, latency_ms: int = 50):
+        self._latency_s = latency_ms / 1000.0
+
+    def generate(
+        self,
+        user_prompt: str,
+        system_prompt: str = "",
+        max_new_tokens: int = 400,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ) -> GenerationResult:
+        time.sleep(self._latency_s)
+
+        # Pull the evidence block back out for inspection.
+        evidence = ""
+        if "EVIDENCE" in user_prompt:
+            evidence = user_prompt.split("EVIDENCE", 1)[1]
+            evidence = evidence.split("ANSWER", 1)[0]
+
+        # Grab the first 3 [Label] markers as our "cited sources".
+        import re
+        labels = re.findall(r"\[([^\]]{1,80})\]", evidence)[:3]
+        citations = ", ".join(f"[{lbl}]" for lbl in labels) or "[no evidence]"
+
+        text = (
+            "[MockLLM stub answer — replace with a real model in Colab.] "
+            f"Based on the retrieved sources {citations}, the assistant would "
+            "synthesize a grounded response here. The pipeline (routing -> "
+            "retrieval -> prompt assembly -> generation) is wired correctly; "
+            "only the language model itself is a stand-in."
+        )
+        # Approximate token counts (1 token ~= 4 chars is a decent rule of thumb).
+        return GenerationResult(
+            text=text,
+            latency_s=self._latency_s,
+            tokens_in=max(1, len(user_prompt) // 4),
+            tokens_out=max(1, len(text) // 4),
         )

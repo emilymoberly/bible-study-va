@@ -48,7 +48,7 @@ HEADERS = {
         "(educational use; contact: student@example.edu)"
     )
 }
-SLEEP_SECONDS = 1.0  # be polite
+SLEEP_SECONDS = 0.4  # be polite but not glacial
 
 ROOT = Path(__file__).resolve().parent.parent
 TRANSCRIPT_DIR = ROOT / "data" / "bema" / "transcripts"
