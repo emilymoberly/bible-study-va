@@ -94,11 +94,16 @@ class LLM:
 
         print(f"[llm] loading {model_id} (device={device}, 4bit={use_4bit})")
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        # NOTE: We intentionally do NOT pass `trust_remote_code=True`. Both
+        # Phi-3.5 and Mistral-7B are supported natively in transformers >=4.41,
+        # and Microsoft's bundled `modeling_phi3.py` for Phi-3.5 calls
+        # `DynamicCache.from_legacy_cache(...)`, which was removed in
+        # transformers >=4.54 — using the native impl avoids that crash.
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        kwargs: dict = {"trust_remote_code": True}
+        kwargs: dict = {}
         if use_4bit:
             kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
