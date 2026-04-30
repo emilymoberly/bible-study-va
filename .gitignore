@@ -13,11 +13,21 @@ venv/
 data/bible/*.json
 data/bema/transcripts/*.txt
 data/bema/episodes.json
+data/bema/episode_pages.json
+data/bema/site_pages.json
+data/bema/log.txt
+data/youtube/transcripts/*.txt
+data/youtube/videos.json
+data/youtube/log.txt
+data/corpus/*
 
 # Keep folder structure
 !data/bible/.gitkeep
 !data/bema/.gitkeep
 !data/bema/transcripts/.gitkeep
+!data/youtube/.gitkeep
+!data/youtube/transcripts/.gitkeep
+!data/corpus/.gitkeep
 
 # OS
 .DS_Store

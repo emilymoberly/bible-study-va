@@ -1,33 +1,39 @@
 """
-The agent: rule-based tool router + grounded answer generator.
+The agent: routes a question, retrieves grounded evidence, asks the LLM.
 
-Pipeline for `answer(question, model)`:
+Architectural change vs. v1
+---------------------------
+v1 routed between three independent tools (Bible / BEMA / Web). v2 uses
+the unified corpus (`src/corpus.py`) which already contains every Bible
+verse, every BEMA transcript chunk, every BEMA show-notes summary, every
+study-tool link, every BEMA static page, and every YouTube caption chunk
+— all labeled by `source_type` and tagged with detected `verse_refs`.
 
-    1. route(question) decides which tools to call
-    2. each tool returns small structured hits
-    3. format_evidence() turns hits into a single labeled EVIDENCE block
-    4. prompts.<technique>() builds (system, user) prompt
-    5. model.generate() runs the LLM and times it
-    6. return Answer(text, sources, latency_s, ...)
+The agent now:
+  1. Parses the question for an explicit Bible reference and a hint about
+     which source types to focus on.
+  2. Calls `Corpus.search(...)` with the chosen filters.
+  3. (Optionally) augments with a DuckDuckGo web hit for "history"-flavored
+     questions, since web context isn't in our corpus.
+  4. Builds an EVIDENCE block + asks the LLM via one of the prompting
+     techniques.
 
-Why rule-based routing?
-We deliberately avoid full ReAct-style tool-use loops because:
-  (a) small open-source models are unreliable at producing valid tool calls
-  (b) the project rubric just requires "use tools"; a router meets that
-  (c) it's far easier to demo / debug / explain
+Public types and functions:
+  RoutingDecision, Source, Answer
+  Agent(corpus, enable_web=True).answer(question, model, technique=...,
+                                       source_types=..., episode=..., verse_ref=...)
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
-from .bible_tool import BibleTool, Verse
-from .bema_tool import BemaTool, BemaChunk
+from .bible_refs import find_refs, normalize_query_ref
+from .corpus import Corpus, CorpusHit
 from .prompts import TECHNIQUES
-from .web_tool import WebHit, WebTool
+from .web_tool import WebTool
 
 if TYPE_CHECKING:
     from .llm import LLM, GenerationResult
@@ -37,91 +43,100 @@ if TYPE_CHECKING:
 # Routing
 # ---------------------------------------------------------------------------
 
-# Direct verse references like "John 3:16", "Genesis 1", "1 Cor 13:4-7".
-# We deliberately match only:
-#   - a single capitalized word ("John", "Genesis"), optionally with a 1/2/3 prefix
-#   - or "Song of Solomon" / "Song of Songs" specifically
-# This prevents over-matching e.g. "Explain John 3:16" -> "Explain John 3:16".
-VERSE_REF_RE = re.compile(
-    r"\b(?:(?:[123]\s+)?[A-Z][a-z]+|Song\s+of\s+(?:Solomon|Songs))"
-    r"\s+\d+(?::\d+(?:-\d+)?)?\b"
+WEB_KEYWORDS = (
+    "history", "historical", "roman", "greek", "egypt", "persian",
+    "babylonian", "archaeolog", "scholar", "modern", "today", "current",
 )
-
-BEMA_KEYWORDS = ("bema", "podcast", "marty solomon", "brent billings",
-                 "chiasm", "discipleship podcast")
-
-WEB_KEYWORDS = ("history", "historical", "roman", "greek", "egypt",
-                "persian", "babylonian", "archaeolog", "scholar", "modern",
-                "today", "current")
-
-# These topics are clearly biblical and should always pull bible_tool +
-# usually bema_tool (BEMA covers them deeply).
-BIBLE_KEYWORDS = ("verse", "passage", "scripture", "bible", "torah",
-                  "gospel", "psalm", "proverb", "covenant", "messiah",
-                  "jesus", "yahweh", "god", "moses", "david", "abraham",
-                  "pharisee", "sadducee", "babylon", "exodus")
+BEMA_HINT = ("bema", "podcast", "marty solomon", "brent billings",
+             "discipleship podcast")
+YOUTUBE_HINT = ("youtube", "video", "talk", "sermon")
 
 
 @dataclass
 class RoutingDecision:
-    use_bible: bool
-    use_bema: bool
+    source_types: list[str]
+    detected_verse_ref: str | None
     use_web: bool
-    direct_refs: list[str] = field(default_factory=list)
-    reason: str = ""
+    reason: str
 
 
-def route(question: str) -> RoutingDecision:
+def route(
+    question: str,
+    explicit_source_types: Iterable[str] | None = None,
+) -> RoutingDecision:
     q = question.lower()
+    detected_ref = normalize_query_ref(question)
 
-    direct_refs = VERSE_REF_RE.findall(question)
-    use_bible = bool(direct_refs) or any(k in q for k in BIBLE_KEYWORDS)
-    use_bema = any(k in q for k in BEMA_KEYWORDS) or use_bible
+    if explicit_source_types:
+        chosen = list(explicit_source_types)
+        reason_bits = ["explicit"]
+    else:
+        # Default: search bible + bema_transcript + bema_summary + youtube.
+        # Add bema_studytool / bema_site only if the user mentions them.
+        chosen = ["bible", "bema_transcript", "bema_summary", "youtube"]
+        if any(k in q for k in BEMA_HINT):
+            chosen.append("bema_studytool")
+            chosen.append("bema_site")
+        reason_bits = ["default"]
+
     use_web = any(k in q for k in WEB_KEYWORDS)
-
-    # Always try Bible if nothing matched — it's our primary data source.
-    if not (use_bible or use_bema or use_web):
-        use_bible = True
-        use_bema = True
-
-    reason_bits = []
-    if direct_refs:
-        reason_bits.append(f"direct refs: {direct_refs}")
-    if use_bible:
-        reason_bits.append("bible")
-    if use_bema:
-        reason_bits.append("bema")
     if use_web:
         reason_bits.append("web")
+    if detected_ref:
+        reason_bits.append(f"verse:{detected_ref}")
 
     return RoutingDecision(
-        use_bible=use_bible,
-        use_bema=use_bema,
+        source_types=chosen,
+        detected_verse_ref=detected_ref,
         use_web=use_web,
-        direct_refs=direct_refs,
         reason=", ".join(reason_bits),
     )
 
 
 # ---------------------------------------------------------------------------
-# Evidence assembly
+# Evidence
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Source:
-    label: str
-    text: str
+    label: str        # short tag used inside the prompt, e.g. "Bible: John 3:16"
+    title: str        # human-readable title for the UI
+    url: str          # back-link for the UI
+    text: str         # excerpt to splice into the prompt
+    source_type: str
+    score: float = 0.0
 
-    def render(self) -> str:
+    def render_for_prompt(self) -> str:
         return f"[{self.label}] {self.text}"
 
 
+def _hit_to_source(hit: CorpusHit) -> Source:
+    c = hit.chunk
+    if c.source_type == "bible":
+        label = f"Bible: {c.title}"
+    elif c.source_type.startswith("bema_"):
+        ep = f"BEMA {c.episode}" if c.episode else "BEMA"
+        kind = c.source_type.split("_", 1)[1]
+        label = f"{ep} {kind}: {c.title[:60]}"
+    elif c.source_type == "youtube":
+        label = f"YouTube: {c.title[:60]}"
+    else:
+        label = c.title[:80]
+    return Source(
+        label=label,
+        title=c.title,
+        url=c.url,
+        text=c.text,
+        source_type=c.source_type,
+        score=hit.score,
+    )
+
+
 def format_evidence(sources: list[Source], max_chars: int = 6000) -> str:
-    """Concatenate sources into a single block, truncating to fit the prompt."""
     out: list[str] = []
     used = 0
     for s in sources:
-        rendered = s.render()
+        rendered = s.render_for_prompt()
         if used + len(rendered) > max_chars:
             break
         out.append(rendered)
@@ -149,80 +164,98 @@ class Answer:
 class Agent:
     def __init__(
         self,
-        bible_path: str | Path,
-        bema_transcripts_dir: str | Path,
-        bema_episodes_json: str | Path,
+        corpus_path: str | Path | Corpus,
         enable_web: bool = True,
     ):
-        self.bible = BibleTool(bible_path)
-        self.bema = BemaTool(bema_transcripts_dir, bema_episodes_json)
+        if isinstance(corpus_path, Corpus):
+            self.corpus = corpus_path
+        else:
+            self.corpus = Corpus(corpus_path)
         self.web: WebTool | None = WebTool() if enable_web else None
 
     # -------------------------------------------------------- retrieval steps
-    def _bible_evidence(self, question: str, decision: RoutingDecision,
-                        k: int = 5) -> list[Source]:
-        sources: list[Source] = []
-        for ref in decision.direct_refs:
-            for v in self.bible.lookup(ref):
-                sources.append(Source(label=f"Bible: {v.reference}", text=v.text))
-        if not sources:  # fall back to TF-IDF search
-            for hit in self.bible.search(question, k=k):
-                v: Verse = hit.item
-                sources.append(Source(label=f"Bible: {v.reference}", text=v.text))
-        return sources
+    def gather(
+        self,
+        question: str,
+        source_types: Iterable[str] | None = None,
+        episode: str | None = None,
+        verse_ref: str | None = None,
+        k: int = 8,
+    ) -> tuple[RoutingDecision, list[Source]]:
+        decision = route(question, explicit_source_types=source_types)
+        ref = verse_ref or decision.detected_verse_ref
 
-    def _bema_evidence(self, question: str, k: int = 3) -> list[Source]:
-        out: list[Source] = []
-        try:
-            hits = self.bema.search(question, k=k)
-        except RuntimeError:
-            return out
-        for hit in hits:
-            c: BemaChunk = hit.item
-            label = f"BEMA {c.episode_number}: {c.episode_title}".strip(": ")
-            out.append(Source(label=label, text=c.text))
-        return out
+        # Primary corpus search
+        hits = self.corpus.search(
+            question,
+            k=k,
+            source_types=decision.source_types,
+            episode=episode,
+            verse_ref=ref,
+        )
+        sources = [_hit_to_source(h) for h in hits]
 
-    def _web_evidence(self, question: str, k: int = 3) -> list[Source]:
-        if self.web is None:
-            return []
-        try:
-            hits = self.web.search(question, k=k)
-        except Exception as e:  # noqa: BLE001
-            return [Source(label="Web error", text=str(e))]
-        return [
-            Source(label=f"Web: {h.url}", text=f"{h.title} — {h.snippet}")
-            for h in hits
-        ]
+        # If a verse ref was detected and we have it in the bible source,
+        # ensure that verse is included as evidence even if it didn't rank.
+        if ref:
+            verse_chunks = self.corpus.lookup_verse(ref)
+            for vc in verse_chunks:
+                # avoid duplicate
+                if any(s.label == f"Bible: {vc.title}" for s in sources):
+                    continue
+                sources.insert(0, Source(
+                    label=f"Bible: {vc.title}",
+                    title=vc.title,
+                    url=vc.url,
+                    text=vc.text,
+                    source_type="bible",
+                    score=1.0,
+                ))
 
-    # ----------------------------------------------------------------- public
-    def gather(self, question: str) -> tuple[RoutingDecision, list[Source]]:
-        decision = route(question)
-        sources: list[Source] = []
-        if decision.use_bible:
-            sources.extend(self._bible_evidence(question, decision))
-        if decision.use_bema:
-            sources.extend(self._bema_evidence(question))
-        if decision.use_web:
-            sources.extend(self._web_evidence(question))
+        # Web augmentation for "history" flavored questions
+        if decision.use_web and self.web is not None:
+            try:
+                web_hits = self.web.search(question, k=2)
+                for h in web_hits:
+                    sources.append(Source(
+                        label=f"Web: {h.url}",
+                        title=h.title,
+                        url=h.url,
+                        text=f"{h.title} — {h.snippet}",
+                        source_type="web",
+                        score=0.0,
+                    ))
+            except Exception as e:  # noqa: BLE001
+                sources.append(Source(
+                    label="Web error", title="(web error)", url="",
+                    text=str(e), source_type="web",
+                ))
+
         return decision, sources
 
+    # ----------------------------------------------------------------- answer
     def answer(
         self,
         question: str,
         model: "LLM",
         technique: str = "zero_shot",
         max_new_tokens: int = 400,
+        source_types: Iterable[str] | None = None,
+        episode: str | None = None,
+        verse_ref: str | None = None,
+        k: int = 8,
     ) -> Answer:
         if technique not in TECHNIQUES:
             raise ValueError(
-                f"Unknown technique '{technique}'. "
-                f"Choose from {list(TECHNIQUES)}."
+                f"Unknown technique '{technique}'. Choose from {list(TECHNIQUES)}."
             )
-        decision, sources = self.gather(question)
+
+        decision, sources = self.gather(
+            question, source_types=source_types, episode=episode,
+            verse_ref=verse_ref, k=k,
+        )
         evidence = format_evidence(sources)
         pair = TECHNIQUES[technique](question, evidence)
-
         result: "GenerationResult" = model.generate(
             user_prompt=pair.user,
             system_prompt=pair.system,

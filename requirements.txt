@@ -18,6 +18,12 @@ tqdm>=4.66.0
 # --- web search tool (no API key) ---
 duckduckgo-search>=6.1.0
 
+# --- youtube captions (no API key, public captions only) ---
+youtube-transcript-api>=0.6.2
+
+# --- gradio UI ---
+gradio>=4.40.0
+
 # --- notebook ---
 jupyterlab>=4.0.0
 ipywidgets>=8.1.0
