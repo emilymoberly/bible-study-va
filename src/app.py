@@ -762,7 +762,7 @@ def build_app(corpus_path: Optional[Path] = None) -> gr.Blocks:
                     label="Source filter",
                 )
                 technique = gr.Dropdown(
-                    ["zero_shot", "few_shot", "chain_of_thought"],
+                    ["zero_shot", "few_shot", "chain_of_thought", "prompt_chaining"],
                     value="zero_shot",
                     label="Prompting technique",
                 )

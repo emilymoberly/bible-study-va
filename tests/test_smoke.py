@@ -116,6 +116,26 @@ def test_prompt_techniques_render():
     assert set(TECHNIQUES) == {"zero_shot", "few_shot", "chain_of_thought"}
 
 
+def test_all_techniques_includes_prompt_chaining():
+    from src.prompts import ALL_TECHNIQUES, CHAINED_TECHNIQUES
+    assert "prompt_chaining" in ALL_TECHNIQUES
+    assert "prompt_chaining" in CHAINED_TECHNIQUES
+    # Single-call ones must NOT be in chained set
+    for t in ("zero_shot", "few_shot", "chain_of_thought"):
+        assert t not in CHAINED_TECHNIQUES
+
+
+def test_prompt_chaining_steps_render():
+    from src.prompts import chain_step1_extract, chain_step2_synthesize
+    p1 = chain_step1_extract("What is a chiasm?", "[BEMA 1] chiasm = literary structure")
+    assert "EVIDENCE" in p1.user
+    assert "RELEVANT FACTS" in p1.user
+    p2 = chain_step2_synthesize("What is a chiasm?",
+                                "- Chiasm is a literary structure [BEMA 1]")
+    assert "EXTRACTED FACTS" in p2.user
+    assert p2.system  # uses the defensive base system prompt
+
+
 # ---------------------------------------------------------------------------
 # New agent routing (Corpus-based)
 # ---------------------------------------------------------------------------
@@ -191,3 +211,56 @@ def test_corpus_filter_by_verse_ref(corpus):
     hits = corpus.lookup_verse("John 3:16")
     assert len(hits) == 1
     assert hits[0].text.lower().startswith("for god so loved")
+
+
+# ---------------------------------------------------------------------------
+# Agent — prompt cache (uses MockLLM so no GPU needed)
+# ---------------------------------------------------------------------------
+
+def test_agent_prompt_cache_hits_and_misses(corpus):
+    from src.agent import Agent
+    from src.llm import MockLLM
+    agent = Agent(corpus, enable_web=False, cache_size=8)
+    mock = MockLLM(latency_ms=10)
+
+    q = "What does the bible say about Babylon?"
+    a1 = agent.answer(q, model=mock, technique="zero_shot")
+    a2 = agent.answer(q, model=mock, technique="zero_shot")
+
+    stats = agent.cache_stats()
+    assert stats["hits"] == 1
+    assert stats["misses"] == 1
+    # Cache hit must be faster than cache miss.
+    assert a2.latency_s < a1.latency_s
+    # Cache hit returns the same answer text.
+    assert a1.text == a2.text
+
+
+def test_agent_cache_disabled_by_default(corpus):
+    from src.agent import Agent
+    from src.llm import MockLLM
+    agent = Agent(corpus, enable_web=False)  # cache_size=0
+    mock = MockLLM(latency_ms=5)
+    agent.answer("anything", model=mock, technique="zero_shot")
+    agent.answer("anything", model=mock, technique="zero_shot")
+    stats = agent.cache_stats()
+    assert stats["hits"] == 0
+    assert stats["misses"] == 0
+    assert stats["size"] == 0
+
+
+def test_agent_prompt_chaining_runs(corpus):
+    """Prompt chaining should call the model twice and return a final answer."""
+    from src.agent import Agent
+    from src.llm import MockLLM
+    agent = Agent(corpus, enable_web=False)
+    mock = MockLLM(latency_ms=5)
+    ans = agent.answer(
+        "What does the bible say about Babylon?",
+        model=mock,
+        technique="prompt_chaining",
+    )
+    assert ans.technique == "prompt_chaining"
+    assert ans.text  # non-empty
+    # Two LLM calls = at least 2x the per-call MockLLM latency.
+    assert ans.latency_s >= 2 * 0.005

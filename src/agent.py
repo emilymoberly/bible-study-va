@@ -26,13 +26,21 @@ Public types and functions:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from .bible_refs import find_refs, normalize_query_ref
 from .corpus import Corpus, CorpusHit
-from .prompts import TECHNIQUES
+from .prompts import (
+    ALL_TECHNIQUES,
+    CHAINED_TECHNIQUES,
+    TECHNIQUES,
+    chain_step1_extract,
+    chain_step2_synthesize,
+)
 from .web_tool import WebTool
 
 if TYPE_CHECKING:
@@ -166,12 +174,74 @@ class Agent:
         self,
         corpus_path: str | Path | Corpus,
         enable_web: bool = True,
+        cache_size: int = 0,
     ):
+        """
+        Parameters
+        ----------
+        corpus_path : str | Path | Corpus
+            Path to corpus.jsonl, or a pre-built Corpus instance.
+        enable_web : bool
+            If True, "history"-flavored questions get a DuckDuckGo augmentation.
+        cache_size : int
+            LRU cache for `answer()`. ``0`` (default) disables caching.
+            When > 0, identical (question, technique, model, params) tuples
+            return the cached Answer with near-zero latency on cache hit.
+            This is the project's prompt-caching component — to demo the
+            speedup, construct two agents (one with cache_size=0, one with
+            cache_size=128) and time the same question twice on each.
+        """
         if isinstance(corpus_path, Corpus):
             self.corpus = corpus_path
         else:
             self.corpus = Corpus(corpus_path)
         self.web: WebTool | None = WebTool() if enable_web else None
+
+        # ----- prompt cache -----------------------------------------------
+        self.cache_size = cache_size
+        self._cache: "OrderedDict[tuple, Answer]" = OrderedDict()
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    # -------------------------------------------------------------- caching
+    def clear_cache(self) -> None:
+        """Drop all cached answers and reset hit/miss counters."""
+        self._cache.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def cache_stats(self) -> dict[str, Any]:
+        """Return a small dict of cache stats for the comparison cell."""
+        total = self.cache_hits + self.cache_misses
+        return {
+            "size": len(self._cache),
+            "max_size": self.cache_size,
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "hit_rate": (self.cache_hits / total) if total else 0.0,
+        }
+
+    @staticmethod
+    def _cache_key(
+        question: str,
+        technique: str,
+        model_id: str,
+        max_new_tokens: int,
+        source_types: Iterable[str] | None,
+        episode: str | None,
+        verse_ref: str | None,
+        k: int,
+    ) -> tuple:
+        return (
+            question.strip().lower(),
+            technique,
+            model_id,
+            max_new_tokens,
+            tuple(sorted(source_types)) if source_types else None,
+            episode,
+            verse_ref,
+            k,
+        )
 
     # -------------------------------------------------------- retrieval steps
     def gather(
@@ -245,31 +315,104 @@ class Agent:
         verse_ref: str | None = None,
         k: int = 8,
     ) -> Answer:
-        if technique not in TECHNIQUES:
+        if technique not in ALL_TECHNIQUES:
             raise ValueError(
-                f"Unknown technique '{technique}'. Choose from {list(TECHNIQUES)}."
+                f"Unknown technique '{technique}'. "
+                f"Choose from {sorted(ALL_TECHNIQUES)}."
             )
 
+        # Cache lookup (LRU)
+        cache_enabled = self.cache_size > 0
+        if cache_enabled:
+            key = self._cache_key(
+                question, technique, model.model_id, max_new_tokens,
+                source_types, episode, verse_ref, k,
+            )
+            cached = self._cache.get(key)
+            if cached is not None:
+                self.cache_hits += 1
+                # Touch for LRU
+                self._cache.move_to_end(key)
+                t0 = time.perf_counter()
+                # Returning the cached answer with the near-zero lookup time
+                # so the latency column in the comparison table reflects the
+                # cache speedup. tokens_out is forced to 0 since no new
+                # generation happened.
+                return replace(
+                    cached,
+                    latency_s=time.perf_counter() - t0,
+                    tokens_out=0,
+                )
+            self.cache_misses += 1
+
+        # Retrieval (shared by all techniques)
         decision, sources = self.gather(
             question, source_types=source_types, episode=episode,
             verse_ref=verse_ref, k=k,
         )
         evidence = format_evidence(sources)
-        pair = TECHNIQUES[technique](question, evidence)
-        result: "GenerationResult" = model.generate(
-            user_prompt=pair.user,
-            system_prompt=pair.system,
-            max_new_tokens=max_new_tokens,
-        )
 
-        return Answer(
+        # Dispatch: single-call vs chained
+        if technique in CHAINED_TECHNIQUES:
+            text, latency, tokens_in, tokens_out = self._run_prompt_chaining(
+                question, evidence, model, max_new_tokens,
+            )
+        else:
+            pair = TECHNIQUES[technique](question, evidence)
+            result: "GenerationResult" = model.generate(
+                user_prompt=pair.user,
+                system_prompt=pair.system,
+                max_new_tokens=max_new_tokens,
+            )
+            text = result.text
+            latency = result.latency_s
+            tokens_in = result.tokens_in
+            tokens_out = result.tokens_out
+
+        ans = Answer(
             question=question,
-            text=result.text,
+            text=text,
             technique=technique,
             routing=decision,
             sources=sources,
-            latency_s=result.latency_s,
-            tokens_in=result.tokens_in,
-            tokens_out=result.tokens_out,
+            latency_s=latency,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
             model_id=model.model_id,
+        )
+
+        if cache_enabled:
+            self._cache[key] = ans
+            if len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+        return ans
+
+    # ---------------------------------------------------- prompt chaining
+    @staticmethod
+    def _run_prompt_chaining(
+        question: str,
+        evidence: str,
+        model: "LLM",
+        max_new_tokens: int,
+    ) -> tuple[str, float, int, int]:
+        """Two-call chain: extract relevant facts → synthesize answer."""
+        # Step 1: extract a focused fact list from the raw evidence.
+        pair1 = chain_step1_extract(question, evidence)
+        s1 = model.generate(
+            user_prompt=pair1.user,
+            system_prompt=pair1.system,
+            max_new_tokens=300,
+        )
+        # Step 2: write the final answer using ONLY the step-1 facts.
+        pair2 = chain_step2_synthesize(question, s1.text)
+        s2 = model.generate(
+            user_prompt=pair2.user,
+            system_prompt=pair2.system,
+            max_new_tokens=max_new_tokens,
+        )
+        return (
+            s2.text,
+            s1.latency_s + s2.latency_s,
+            s1.tokens_in + s2.tokens_in,
+            s1.tokens_out + s2.tokens_out,
         )
