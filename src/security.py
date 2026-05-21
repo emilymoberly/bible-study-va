@@ -178,7 +178,13 @@ def _run_one(
     decision, sources = agent.gather(attack.question)
     if attack.poisoned_evidence:
         # Prepend the poisoned source so the attack is visible to the model
-        sources = [Source(label="POISONED", text=attack.poisoned_evidence)] + sources
+        sources = [Source(
+            label="POISONED",
+            title="(poisoned)",
+            url="",
+            text=attack.poisoned_evidence,
+            source_type="poisoned",
+        )] + sources
 
     evidence = format_evidence(sources)
     pair = TECHNIQUES[technique](attack.question, evidence)
