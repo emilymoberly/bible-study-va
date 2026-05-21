@@ -213,6 +213,26 @@ def test_corpus_filter_by_verse_ref(corpus):
     assert hits[0].text.lower().startswith("for god so loved")
 
 
+def test_corpus_lookup_verse_range(corpus):
+    """Range refs expand to one chunk per verse, in canonical order."""
+    hits = corpus.lookup_verse("Genesis 1:1-3")
+    assert [c.title for c in hits] == ["Genesis 1:1", "Genesis 1:2", "Genesis 1:3"]
+    assert "beginning" in hits[0].text.lower()
+
+
+def test_corpus_search_filter_by_verse_range(corpus):
+    """The verse_ref filter also expands ranges, so a range query still hits."""
+    hits = corpus.search(
+        "in the beginning",
+        k=5,
+        source_types=["bible"],
+        verse_ref="Genesis 1:1-3",
+    )
+    titles = {h.chunk.title for h in hits}
+    assert titles.issubset({"Genesis 1:1", "Genesis 1:2", "Genesis 1:3"})
+    assert titles  # at least one of the three came back
+
+
 # ---------------------------------------------------------------------------
 # Agent — prompt cache (uses MockLLM so no GPU needed)
 # ---------------------------------------------------------------------------

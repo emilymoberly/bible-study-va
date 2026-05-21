@@ -19,6 +19,7 @@ project remains lightweight.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -27,6 +28,34 @@ from typing import Iterable
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+
+# Matches normalized range refs like "Genesis 1:1-3" or "1 Corinthians 13:1-13".
+# Single-verse and chapter-only refs do NOT match and are returned unchanged.
+_RANGE_RE = re.compile(r"^(.+?)\s+(\d+):(\d+)-(\d+)$")
+
+# Safety cap on range expansion. Prevents pathological inputs like
+# "Psalms 119:1-176" from blowing up the filter.
+_MAX_RANGE_EXPAND = 50
+
+
+def _expand_verse_range(verse_ref: str) -> list[str]:
+    """Expand a verse-range ref into one entry per verse.
+
+    "Genesis 1:1-3"  -> ["Genesis 1:1", "Genesis 1:2", "Genesis 1:3"]
+    "John 3:16"      -> ["John 3:16"]
+    "Psalms 23"      -> ["Psalms 23"]   (chapter-only, not a range)
+    """
+    ref = verse_ref.strip()
+    m = _RANGE_RE.match(ref)
+    if not m:
+        return [ref]
+    book, ch, vs, ve = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    if ve < vs:
+        return [f"{book} {ch}:{vs}"]
+    if ve - vs + 1 > _MAX_RANGE_EXPAND:
+        ve = vs + _MAX_RANGE_EXPAND - 1
+    return [f"{book} {ch}:{v}" for v in range(vs, ve + 1)]
 
 
 @dataclass(frozen=True)
@@ -142,8 +171,12 @@ class Corpus:
             mask &= np.array([c.episode == ep_str for c in self.chunks])
 
         if verse_ref:
-            ref = verse_ref.strip()
-            mask &= np.array([ref in c.verse_refs for c in self.chunks])
+            # Expand verse ranges so e.g. "Genesis 1:1-3" matches any chunk
+            # whose verse_refs include Gen 1:1, 1:2, or 1:3 individually.
+            wanted = set(_expand_verse_range(verse_ref))
+            mask &= np.array([
+                bool(wanted.intersection(c.verse_refs)) for c in self.chunks
+            ])
 
         return np.where(mask)[0]
 
@@ -183,6 +216,14 @@ class Corpus:
 
     # ------------------------------------------------------------------ exact
     def lookup_verse(self, verse_ref: str) -> list[CorpusChunk]:
-        """Return any bible chunks whose title matches the given normalized ref."""
-        ref = verse_ref.strip()
-        return [c for c in self.chunks if c.source_type == "bible" and c.title == ref]
+        """Return bible chunks whose title matches the given normalized ref.
+
+        Verse ranges are expanded — `lookup_verse("Genesis 1:1-3")` returns
+        the three chunks for Gen 1:1, 1:2, 1:3 in canonical order. Missing
+        verses (e.g. a typo'd reference) are silently skipped.
+        """
+        wanted = _expand_verse_range(verse_ref)
+        by_title: dict[str, CorpusChunk] = {
+            c.title: c for c in self.chunks if c.source_type == "bible"
+        }
+        return [by_title[r] for r in wanted if r in by_title]
